@@ -1,0 +1,399 @@
+name: CI/CD for C# Script
+
+on: [push, pull_request]
+
+jobs:
+
+#Первый этап - тест
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Run tests
+      run: |
+        cd tests
+        dotnet test --logger "trx;LogFileName=test-results.trx"
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: tests/TestResults/*.trx
+
+#Второй этап - проверка безопасности с помощью virustotal 
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Debug project structure
+      run: |
+        echo "Current directory: $(pwd)"
+        echo "Project files:"
+        find . -name "*.csproj"
+        echo "Solution files:"
+        find . -name "*.sln"
+    
+    - name: Build project
+      run: dotnet build src --configuration Release
+    
+    - name: Check vulnerable packages
+      run: |
+        PROJECT_FILE=$(find src -name "*.csproj" | head -1)
+        if [ -z "$PROJECT_FILE" ]; then
+          echo "Error: No .csproj file found in src directory!"
+          exit 1
+        fi
+        echo "Checking vulnerabilities in $PROJECT_FILE"
+        dotnet list "$PROJECT_FILE" package --vulnerable
+    
+    - name: List build artifacts
+      run: ls -la src/bin/Release/net8.0/
+    
+    - name: VirusTotal scan
+      run: |
+        echo "Starting VirusTotal scan..."
+        DLL_FILE=$(find src/bin/Release/net8.0 -name "*.dll" | head -1)
+        if [ -z "$DLL_FILE" ]; then
+          echo "Error: No .dll files found in src/bin/Release/net8.0/"
+          ls -la src/bin/Release/net8.0/
+          exit 1
+        fi
+        
+        echo "Scanning $DLL_FILE with VirusTotal..."
+        SCAN_RESULT=$(curl -s -X POST \
+          -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
+          -F "file=@$DLL_FILE" \
+          https://www.virustotal.com/api/v3/files)
+        
+        echo "Scan results:"
+        echo "$SCAN_RESULT" | jq .
+        echo "VirusTotal scan completed for $DLL_FILE"
+
+#Этап третий -сборка
+  build:
+    needs: security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Build
+      run: dotnet build src --configuration Release
+    
+    - name: Bump version
+      run: |
+        # Читаем текущую версию
+        CURRENT_VERSION=$(cat version)
+        IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+        MAJOR=${VERSION_PARTS[0]}
+        MINOR=${VERSION_PARTS[1]}
+        PATCH=${VERSION_PARTS[2]}
+        
+        # Определяем тип изменения по названию ветки
+        if [[ "$GITHUB_HEAD_REF" == feat/* ]]; then
+          echo "Feature branch detected, bumping minor version"
+          MINOR=$((MINOR + 1))
+          PATCH=0
+        elif [[ "$GITHUB_HEAD_REF" == fix/* ]]; then
+          echo "Fix branch detected, bumping patch version"
+          PATCH=$((PATCH + 1))
+        else
+          echo "No version bump needed for branch $GITHUB_HEAD_REF"
+        fi
+        
+        # Формируем новую версию
+        NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+        
+        # Сохраняем новую версию только если она изменилась
+        if [ "$NEW_VERSION" != "$CURRENT_VERSION" ]; then
+          echo "$NEW_VERSION" > version
+          echo "Version bumped from $CURRENT_VERSION to $NEW_VERSION"
+        else
+          echo "Version remains $CURRENT_VERSION"
+        fi
+    
+    - name: Update changelog
+      run: |
+        echo "Creating temporary changelog file..."
+        TEMP_CHANGELOG="changelog_$(date +%s).tmp"
+        
+        echo "## [v$(cat version)] - $(date +'%Y-%m-%d')" > $TEMP_CHANGELOG
+        echo "- Build $GITHUB_RUN_NUMBER" >> $TEMP_CHANGELOG
+        echo "- Merged from $GITHUB_HEAD_REF" >> $TEMP_CHANGELOG
+        echo "" >> $TEMP_CHANGELOG
+        
+        if [ -f changelog.md ]; then
+          echo "Appending existing changelog..."
+          cat changelog.md >> $TEMP_CHANGELOG
+        else
+          echo "No existing changelog found, creating new one..."
+        fi
+        
+        mv $TEMP_CHANGELOG changelog.md
+        echo "Changelog updated successfully"
+        
+        echo "Creating changelog.txt..."
+        {
+          echo "Version: $(cat version)"
+          echo "Build: $GITHUB_RUN_NUMBER"
+          echo "Date: $(date +'%Y-%m-%d %H:%M:%S')"
+          echo ""
+          echo "Changes:"
+          [ -f changelog.md ] && tail -n +3 changelog.md
+        } > changelog.txt
+        echo "Changelog.txt created successfully"
+        
+    - name: Commit and push changes
+      env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+            echo "Configuring git..."
+            git config --global user.name "GitHub Actions"
+            git config --global user.email "actions@github.com"
+            
+            echo "Determining current branch..."
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            echo "Working on branch: $CURRENT_BRANCH"
+            
+            echo "Adding files to git..."
+            git add changelog.md
+            git add changelog.txt
+            git add version
+            
+            echo "Checking for changes..."
+            if ! git diff-index --quiet HEAD --; then
+              echo "Committing changes..."
+              git commit -m "CI: Update changelog for v$(cat version) [skip ci]"
+              
+              echo "Pulling latest changes..."
+              git pull origin $CURRENT_BRANCH
+              
+              echo "Pushing changes..."
+              git push "https://$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY.git" HEAD:$CURRENT_BRANCH
+              
+              echo "Changes pushed successfully to $CURRENT_BRANCH"
+            else
+              echo "No changes to commit"
+            fi
+
+#Этап четвертый - сообщение в тг
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true  
+  
+      - name: Setup timezone
+        run: |
+          sudo timedatectl set-timezone Europe/Moscow
+          echo "Current time: $(date)"
+  
+      - name: Verify version file
+        run: |
+          if [ ! -f version ]; then
+            echo "1.0.0" > version
+            echo "Created version file with default value"
+          fi
+          echo "Current version: $(cat version)"
+  
+      - name: Increment version
+        run: |
+          awk -F. '{ OFS="."; $3++; print }' version > version.tmp
+          mv version.tmp version
+          echo "New version: $(cat version)"
+          
+          # Фикс push изменений версии
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add version
+          git commit -m "CI: Auto-increment version to $(cat version)" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }} || echo "Push failed or nothing to push"
+  
+      - name: Get version info
+        id: version
+        run: |
+          echo "version=$(cat version)" >> $GITHUB_OUTPUT
+          echo "build_number=$GITHUB_RUN_NUMBER" >> $GITHUB_OUTPUT
+          echo "run_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> $GITHUB_OUTPUT
+  
+      - name: Prepare changelog.txt
+        run: |
+          # Ваш оригинальный код без изменений
+          echo "╔══════════════════════════════╗" > changelog.txt
+          echo "║        BUILD SUMMARY         ║" >> changelog.txt
+          echo "╠══════════════════════════════╣" >> changelog.txt
+          echo "║ Version: $(cat version)      ║" >> changelog.txt
+          echo "║ Build: #$GITHUB_RUN_NUMBER   ║" >> changelog.txt
+          echo "║ Date: $(date +'%Y-%m-%d %H:%M MSK') ║" >> changelog.txt
+          echo "╚══════════════════════════════╝" >> changelog.txt
+          echo "" >> changelog.txt
+          
+          if [ -f changelog.md ]; then
+            echo "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄" >> changelog.txt
+            echo "█ RECENT CHANGES:" >> changelog.txt
+            echo "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀" >> changelog.txt
+            grep -v '^##' changelog.md | head -n 5 | sed 's/^-/•/' >> changelog.txt
+          fi
+  
+          echo "Changelog content preview:"
+          cat changelog.txt
+  
+          chmod 644 changelog.txt
+  
+      - name: Trim changelog.md
+        run: |
+          if [ -f changelog.md ]; then
+            echo "Trimming changelog.md..."
+            head -n 20 changelog.md > changelog.tmp
+            mv changelog.tmp changelog.md
+            
+            git config --global user.name "GitHub Actions"
+            git config --global user.email "actions@github.com"
+            git add changelog.md
+            git commit -m "CI: Trim changelog.md" || echo "No changes to commit"
+            git push origin HEAD:${{ github.ref_name }} || echo "Push failed or nothing to push"
+          fi
+  
+      - name: Validate files before sending
+        run: |
+          echo "=== Current directory ==="
+          pwd
+          ls -la
+          
+          echo "=== version file ==="
+          cat version
+          
+          echo "=== changelog.txt ==="
+          if [ ! -f changelog.txt ]; then
+            echo "::error::changelog.txt not found!"
+            exit 1
+          fi
+          ls -la changelog.txt
+          echo "File size: $(wc -c < changelog.txt) bytes"
+          
+          if [ ! -s changelog.txt ]; then
+            echo "::error::changelog.txt is empty!"
+            exit 1
+          fi
+  
+      - name: Send Telegram notification
+        run: |
+          # Проверяем наличие необходимых файлов и переменных
+          echo "Checking files and variables..."
+          echo "Workspace: ${{ github.workspace }}"
+          ls -la ${{ github.workspace }}/
+          echo "Version: $(cat version)"
+          echo "Changelog content:"
+          cat ${{ github.workspace }}/changelog.txt || echo "No changelog.txt found"
+      
+            TEXT="🚀 *Сборка #${{ steps.version.outputs.build_number }} успешна\!*\n\n"
+            TEXT+="🏷 *Версия:* \`${{ steps.version.outputs.version }}\`\n"
+            TEXT+="📅 *Дата:* $(date +'%Y-%m-%d %H:%M MSK')\n"
+            TEXT+="🔗 *Подробности:* [${{ github.repository }}](${{ steps.version.outputs.run_url }})\n\n"
+            TEXT+="_Изменения во вложенном файле_ ↓"
+          
+          echo "Sending message to Telegram..."
+          echo "Message text:"
+          echo "$TEXT"
+      
+          MESSAGE_RESPONSE=$(curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="$TEXT")
+          
+          echo "Telegram API response for message:"
+          echo "$MESSAGE_RESPONSE"
+          
+          echo "Sending changelog file..."
+          FILE_RESPONSE=$(curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \
+            -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -F document=@"${{ github.workspace }}/changelog.txt")
+          
+          echo "Telegram API response for file:"
+          echo "$FILE_RESPONSE"
+          
+          # Проверяем ответы API
+          if [[ $(echo "$MESSAGE_RESPONSE" | jq -r '.ok') != 'true' ]]; then
+             echo "::error::Failed to send Telegram message"
+             echo "Response: $MESSAGE_RESPONSE"
+             exit 1
+          fi
+      
+          if [[ $(echo "$FILE_RESPONSE" | jq -r '.ok') != 'true' ]]; then
+             echo "::error::Failed to send Telegram file"
+             echo "Response: $FILE_RESPONSE"
+             exit 1
+          fi
+      
+          echo "Telegram notification sent successfully!"
+  
+      - name: Verify files were committed
+        if: always()
+        run: |
+          echo "=== Git status ==="
+          git status
+          echo "=== Version file content ==="
+          cat version
+          echo "=== Latest commit ==="
+          git log -1
+          echo "=== changelog.txt content ==="
+          cat changelog.txt || echo "changelog.txt not found"
+
+
+#Этап пятый -  жокер хаб)
+  dockerhub_publish:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker login
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(tr -d '\r\n ' < version); v=${v#v}
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} .
+
+      - name: Push image
+        run: docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }}
+
+      - name: Add dockerhub label
+        if: github.event.pull_request != null
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          labels: docker-published
