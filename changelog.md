@@ -1,4 +1,8 @@
 ## [v1.0.2] - 2025-10-17
+- Build 18
+- Branch: main
+
+## [v1.0.2] - 2025-10-17
 - Branch: main
 - Commit: Update ci-cd.yml
 - Build: #15
