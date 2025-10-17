@@ -59,7 +59,7 @@ jobs:
               https://www.virustotal.com/api/v3/files | jq . || echo "::warning::VirusTotal scan failed"
           fi
 
-  build:
+    build:
     needs: security
     runs-on: ubuntu-latest
     permissions:
@@ -79,104 +79,76 @@ jobs:
       - name: Build
         run: dotnet build src --configuration Release || echo "::warning::Build failed"
 
-      - name: Bump version safely
+      - name: Detect and bump version
+        id: version
         run: |
           if [ ! -f version ]; then echo "1.0.0" > version; fi
           CURRENT_VERSION=$(cat version)
           IFS='.' read -ra V <<< "$CURRENT_VERSION"
           MAJOR=${V[0]}; MINOR=${V[1]}; PATCH=${V[2]}
-          if [[ "$GITHUB_HEAD_REF" == feat/* ]]; then
-            MINOR=$((MINOR+1)); PATCH=0
-          elif [[ "$GITHUB_HEAD_REF" == fix/* ]]; then
-            PATCH=$((PATCH+1))
+
+          # Определяем контекст (PR, merge, push)
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          echo "Current branch: $BRANCH"
+
+          if [[ "$BRANCH" == feat/* ]]; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          elif [[ "$BRANCH" == fix/* ]]; then
+            PATCH=$((PATCH + 1))
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            # Если push в main — патч-обновление
+            PATCH=$((PATCH + 1))
           fi
-          echo "$MAJOR.$MINOR.$PATCH" > version
-          echo "New version: $(cat version)"
 
-      - name: Update changelog
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "$NEW_VERSION" > version
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "Bumped version: $NEW_VERSION"
+
+      - name: Update changelog (always on version change)
         run: |
-          TEMP="changelog_$(date +%s).tmp"
-          echo "## [v$(cat version)] - $(date +'%Y-%m-%d')" > $TEMP
-          echo "- Build $GITHUB_RUN_NUMBER" >> $TEMP
-          echo "- Branch $GITHUB_HEAD_REF" >> $TEMP
-          [ -f changelog.md ] && cat changelog.md >> $TEMP
-          mv $TEMP changelog.md
-          echo "Version: $(cat version)" > changelog.txt
-          echo "Build: $GITHUB_RUN_NUMBER" >> changelog.txt
-          echo "Date: $(date)" >> changelog.txt
+          NEW_VERSION=$(cat version)
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
 
-      - name: Commit & Push changes
+          echo "Updating changelog for version $NEW_VERSION"
+
+          TEMP_FILE="changelog_$(date +%s).tmp"
+          {
+            echo "## [v${NEW_VERSION}] - $(date +'%Y-%m-%d')"
+            if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+              echo "- Merged from ${BRANCH}"
+            else
+              echo "- Commit: ${COMMIT_MSG}"
+            fi
+            echo "- Build: #${GITHUB_RUN_NUMBER}"
+            echo ""
+          } > "$TEMP_FILE"
+
+          [ -f changelog.md ] && cat changelog.md >> "$TEMP_FILE"
+          mv "$TEMP_FILE" changelog.md
+
+          {
+            echo "Version: ${NEW_VERSION}"
+            echo "Branch: ${BRANCH}"
+            echo "Commit: ${COMMIT_MSG}"
+            echo "Date: $(date +'%Y-%m-%d %H:%M:%S')"
+            echo ""
+            echo "Changes:"
+            tail -n +3 changelog.md
+          } > changelog.txt
+
+      - name: Commit & Push changelog
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
+
           git add version changelog.md changelog.txt
-          git commit -m "CI: Update version $(cat version)" || echo "Nothing to commit"
-          git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:${GITHUB_REF_NAME} || echo "::warning::Push failed"
-
-  notify:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Prepare changelog.txt
-        run: |
-          if [ ! -f changelog.txt ]; then
-            echo "::warning::No changelog.txt found, creating default"
-            echo "Build info missing" > changelog.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "CI: Update changelog for v$(cat version)" || true
+            git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:${GITHUB_REF_NAME} || echo "::warning::Push failed"
           fi
-          echo "File content:"
-          cat changelog.txt
-
-      - name: Send Telegram notification
-        run: |
-          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
-            echo "::warning::Telegram secrets not set, skipping notification"
-            exit 0
-          fi
-
-          TEXT="🚀 *Сборка успешна*%0A"
-          TEXT+="🏷 Версия: $(cat version)%0A"
-          TEXT+="📅 Дата: $(date +'%Y-%m-%d %H:%M MSK')%0A"
-          TEXT+="🔗 Репозиторий: ${{ github.repository }}"
-
-          curl -s -X POST \
-            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d parse_mode="MarkdownV2" \
-            -d text="$TEXT" || echo "::warning::Telegram message failed"
-
-          curl -s -X POST \
-            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \
-            -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -F document=@changelog.txt || echo "::warning::Telegram file send failed"
-
-  dockerhub_publish:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Docker login
-        run: |
-          if [ -z "${{ secrets.DOCKER_HUB_TOKEN }}" ]; then
-            echo "::warning::No Docker token, skipping"
-            exit 0
-          fi
-          echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
-
-      - name: Read version
-        id: ver
-        run: |
-          v=$(cat version 2>/dev/null || echo "1.0.0")
-          echo "VERSION=$v" >> $GITHUB_OUTPUT
-
-      - name: Build image
-        run: |
-          docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} . || echo "::warning::Docker build failed"
-
-      - name: Push image
-        run: |
-          docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} || echo "::warning::Docker push failed"
