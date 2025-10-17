@@ -14,7 +14,7 @@ permissions:
 
 jobs:
 
-  # === ЭТАП 1: Тесты ===
+ 
   test:
     runs-on: ubuntu-latest
     steps:
