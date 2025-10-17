@@ -1,153 +1,225 @@
-name: CI/CD Pipeline
+name: CI/CD for C# Script
 
-on:
-  push:
-    branches:
-      - main
-      - dev
-  pull_request:
-    branches:
-      - main
-      - dev
-
-permissions:
-  contents: write
+on: [push, pull_request]
 
 jobs:
-  build:
+
+  # === 1. TEST STAGE ===
+  test:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
         with:
-          node-version: 20
+          dotnet-version: '8.0.x'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Run tests
+        run: |
+          cd tests
+          dotnet test --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: tests/TestResults/*.trx
+
+  # === 2. SECURITY STAGE ===
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Debug project structure
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Project files:"; find . -name "*.csproj"
+          echo "Solution files:"; find . -name "*.sln"
 
       - name: Build project
-        run: npm run build
+        run: dotnet build src --configuration Release
 
-      # 🧮 Version bump logic
-      - name: Auto-increment version
-        id: versioning
+      - name: Check vulnerable packages
         run: |
-          echo "🔍 Calculating next version..."
-          if [ ! -f version ]; then
-            echo "v1.0.0" > version
+          PROJECT_FILE=$(find src -name "*.csproj" | head -1)
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "Error: No .csproj file found in src directory!"
+            exit 1
           fi
+          dotnet list "$PROJECT_FILE" package --vulnerable || true
 
-          OLD_VERSION=$(cat version | sed 's/v//')
-          IFS='.' read -r major minor patch <<< "$OLD_VERSION"
+      - name: VirusTotal scan
+        run: |
+          echo "Starting VirusTotal scan..."
+          DLL_FILE=$(find src/bin/Release/net8.0 -name "*.dll" | head -1)
+          if [ -z "$DLL_FILE" ]; then
+            echo "No .dll found"
+            exit 0
+          fi
+          SCAN_RESULT=$(curl -s -X POST \
+            -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
+            -F "file=@$DLL_FILE" \
+            https://www.virustotal.com/api/v3/files)
+          echo "$SCAN_RESULT" | jq . || true
 
-          patch=$((patch + 1))
-          NEW_VERSION="v${major}.${minor}.${patch}"
+  # === 3. BUILD STAGE ===
+  build:
+    needs: security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build project
+        run: dotnet build src --configuration Release
+
+      - name: Bump version
+        run: |
+          CURRENT_VERSION=$(cat version 2>/dev/null || echo "1.0.0")
+          IFS='.' read -ra PARTS <<< "$CURRENT_VERSION"
+          MAJOR=${PARTS[0]}
+          MINOR=${PARTS[1]}
+          PATCH=${PARTS[2]}
+          
+          if [[ "$GITHUB_HEAD_REF" == feat/* ]]; then
+            MINOR=$((MINOR + 1)); PATCH=0
+          elif [[ "$GITHUB_HEAD_REF" == fix/* ]]; then
+            PATCH=$((PATCH + 1))
+          fi
+          
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "$NEW_VERSION" > version
-          echo "version=$NEW_VERSION" >> $GITHUB_ENV
+          echo "Version bumped from $CURRENT_VERSION to $NEW_VERSION"
 
-          echo "🔢 Old: v$OLD_VERSION → New: $NEW_VERSION"
-
-      # 📝 Update changelog (сохраняет старые версии!)
-      - name: Update changelog (preserve old versions)
+      - name: Update changelog
         run: |
-          NEW_VERSION=$(cat version)
-          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-          COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1 || echo "")
-          DATE_FULL=$(date +'%Y-%m-%d %H:%M:%S')
-          DATE_SHORT=$(date +'%Y-%m-%d')
-
-          echo "Updating changelog for version $NEW_VERSION (branch: $BRANCH)"
-
-          TEMP_FILE="changelog_${NEW_VERSION}_$(date +%s).tmp"
-
+          VERSION=$(cat version)
+          TEMP="changelog_$(date +%s).tmp"
           {
-            echo "## [${NEW_VERSION}] - ${DATE_SHORT}"
-            echo "- Branch: ${BRANCH}"
-            if [ -n "${COMMIT_MSG}" ]; then
-              echo "- Commit: ${COMMIT_MSG}"
-            fi
-            echo "- Build: #${GITHUB_RUN_NUMBER}"
-            echo "- Date: ${DATE_FULL}"
-            echo ""
-          } > "$TEMP_FILE"
+            echo "## [v$VERSION] - $(date +'%Y-%m-%d')"
+            echo "- Build $GITHUB_RUN_NUMBER"
+            echo "- Branch: ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+            echo
+            [ -f changelog.md ] && cat changelog.md
+          } > "$TEMP"
+          mv "$TEMP" changelog.md
+          echo "Changelog updated"
 
-          if [ -f changelog.md ]; then
-            cat changelog.md >> "$TEMP_FILE"
-          fi
-
-          mv "$TEMP_FILE" changelog.md
-          echo "✅ changelog.md updated (old versions preserved)."
-
-          # Create changelog.txt for Telegram/Docker
-          {
-            echo "Version: ${NEW_VERSION}"
-            echo "Branch: ${BRANCH}"
-            if [ -n "${COMMIT_MSG}" ]; then
-              echo "Commit: ${COMMIT_MSG}"
-            fi
-            echo "Date: ${DATE_FULL}"
-            echo ""
-            echo "Recent changelog:"
-            head -n 20 changelog.md || true
-          } > changelog.txt
-
-          echo "📄 changelog.txt generated successfully."
-
-      # 🧠 Commit and push changes (исправлено exit code 128)
       - name: Commit and push changes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔧 Configuring git..."
+          set -e
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git add changelog.md changelog.txt version || true
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "CI: Update changelog for v$(cat version) [skip ci]" || true
+          git pull --rebase origin $BRANCH || true
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$BRANCH || echo "⚠️ Push skipped"
 
-          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "📦 Current branch: $CURRENT_BRANCH"
+  # === 4. NOTIFY STAGE ===
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-          git add changelog.md changelog.txt version
+      - name: Setup timezone
+        run: sudo timedatectl set-timezone Europe/Moscow
 
-          if ! git diff-index --quiet HEAD --; then
-            git commit -m "CI: Update changelog for $(cat version) [skip ci]"
-            echo "🚀 Pushing changes..."
-            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$CURRENT_BRANCH --force-with-lease
-          else
-            echo "✅ No changes to commit."
-          fi
-
-      # 🐳 Docker build & push (если нужно)
-      - name: Build and push Docker image
-        if: github.ref == 'refs/heads/main'
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Verify and increment version
         run: |
-          docker login -u "$DOCKERHUB_USERNAME" -p "$DOCKERHUB_TOKEN"
-          IMAGE_NAME="${DOCKERHUB_USERNAME}/my-app"
-          VERSION=$(cat version)
-          docker build -t "${IMAGE_NAME}:${VERSION}" -t "${IMAGE_NAME}:latest" .
-          docker push "${IMAGE_NAME}:${VERSION}"
-          docker push "${IMAGE_NAME}:latest"
-          echo "🐳 Docker image ${IMAGE_NAME}:${VERSION} pushed successfully."
+          [ ! -f version ] && echo "1.0.0" > version
+          awk -F. '{OFS="."; $3++; print}' version > v.tmp && mv v.tmp version
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add version
+          git commit -m "CI: Auto-increment version to $(cat version)" || true
+          git push origin HEAD:${{ github.ref_name }} || true
 
-      # 📢 Telegram notification (опционально)
+      - name: Prepare changelog
+        run: |
+          VERSION=$(cat version)
+          {
+            echo "╔════════════════════════════════════╗"
+            echo "║          BUILD SUMMARY             ║"
+            echo "╠════════════════════════════════════╣"
+            echo "║ Version: $VERSION"
+            echo "║ Build: #$GITHUB_RUN_NUMBER"
+            echo "║ Date: $(date +'%Y-%m-%d %H:%M MSK')"
+            echo "╚════════════════════════════════════╝"
+            echo ""
+            echo "Recent changes:"
+            grep -v '^##' changelog.md | head -n 5 | sed 's/^-/•/'
+          } > changelog.txt
+          cat changelog.txt
+
       - name: Send Telegram notification
-        if: success()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          VERSION=$(cat version)
-          MESSAGE="✅ *New Build:* ${VERSION}%0A*Branch:* ${GITHUB_REF_NAME}%0A*Commit:* $(git log -1 --pretty=%s)%0A*Date:* $(date +'%Y-%m-%d %H:%M:%S')"
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-               -d "chat_id=${TELEGRAM_CHAT_ID}" \
-               -d "text=${MESSAGE}" \
-               -d "parse_mode=Markdown"
+          TEXT="🚀 *Сборка #${{ github.run_number }} успешна!*%0A"
+          TEXT+="🏷 Версия: \`${{ github.ref_name }}\`%0A"
+          TEXT+="📅 Дата: $(date +'%Y-%m-%d %H:%M MSK')%0A"
+          TEXT+="🔗 [Открыть GitHub Actions]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)%0A%0A"
+          TEXT+="_Изменения во вложенном файле_ ↓"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="$TEXT" || echo "⚠️ Telegram message failed"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \
+            -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -F document=@"changelog.txt" || echo "⚠️ Telegram file failed"
+
+  # === 5. DOCKERHUB PUBLISH ===
+  dockerhub_publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
+      - name: Read version
+        id: ver
+        run: |
+          v=$(tr -d '\r\n ' < version); v=${v#v}
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+      - name: Build image
+        run: docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} .
+      - name: Push image
+        run: docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }}
+      - name: Add dockerhub label
+        if: github.event.pull_request != null
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          labels: docker-published
