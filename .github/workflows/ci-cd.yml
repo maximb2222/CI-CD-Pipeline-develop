@@ -4,62 +4,82 @@ on: [push, pull_request]
 
 jobs:
 
+# =======================
+# Этап 1 — тестирование
+# =======================
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
+
       - name: Run tests
         run: |
-          cd tests || exit 0
-          dotnet test --logger "trx;LogFileName=test-results.trx" || echo "::warning::Tests failed or missing"
+          cd tests
+          dotnet test --logger "trx;LogFileName=test-results.trx"
+
       - name: Upload test results
         uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: tests/TestResults/*.trx
-        continue-on-error: true
 
+
+# =========================================
+# Этап 2 — проверка безопасности (VirusTotal)
+# =========================================
   security:
     needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
 
+      - name: Debug project structure
+        run: |
+          echo "Current directory: $(pwd)"
+          find . -name "*.csproj" -o -name "*.sln"
+
       - name: Build project
-        run: dotnet build src --configuration Release || echo "::warning::Build failed"
+        run: dotnet build src --configuration Release
 
       - name: Check vulnerable packages
         run: |
           PROJECT_FILE=$(find src -name "*.csproj" | head -1)
           if [ -z "$PROJECT_FILE" ]; then
-            echo "::warning::No .csproj found, skipping vulnerability check"
-          else
-            dotnet list "$PROJECT_FILE" package --vulnerable || echo "::warning::Vulnerability check failed"
+            echo "Error: No .csproj file found!"
+            exit 1
           fi
+          echo "Checking vulnerabilities in $PROJECT_FILE"
+          dotnet list "$PROJECT_FILE" package --vulnerable
 
       - name: VirusTotal scan
         run: |
+          echo "Starting VirusTotal scan..."
           DLL_FILE=$(find src/bin/Release/net8.0 -name "*.dll" | head -1)
           if [ -z "$DLL_FILE" ]; then
-            echo "::warning::No DLL found to scan"
-          elif [ -z "${{ secrets.VIRUSTOTAL_API_KEY }}" ]; then
-            echo "::warning::VIRUSTOTAL_API_KEY not set"
-          else
-            curl -s -X POST \
-              -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
-              -F "file=@$DLL_FILE" \
-              https://www.virustotal.com/api/v3/files | jq . || echo "::warning::VirusTotal scan failed"
+            echo "Error: No .dll found!"
+            exit 1
           fi
+          SCAN_RESULT=$(curl -s -X POST \
+            -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
+            -F "file=@$DLL_FILE" \
+            https://www.virustotal.com/api/v3/files)
+          echo "$SCAN_RESULT" | jq .
 
-    build:
+
+# =========================================
+# Этап 3 — сборка + changelog (исправленный)
+# =========================================
+  build:
     needs: security
     runs-on: ubuntu-latest
     permissions:
@@ -87,7 +107,6 @@ jobs:
           IFS='.' read -ra V <<< "$CURRENT_VERSION"
           MAJOR=${V[0]}; MINOR=${V[1]}; PATCH=${V[2]}
 
-          # Определяем контекст (PR, merge, push)
           BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           echo "Current branch: $BRANCH"
 
@@ -96,7 +115,6 @@ jobs:
           elif [[ "$BRANCH" == fix/* ]]; then
             PATCH=$((PATCH + 1))
           elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            # Если push в main — патч-обновление
             PATCH=$((PATCH + 1))
           fi
 
@@ -110,7 +128,6 @@ jobs:
           NEW_VERSION=$(cat version)
           BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
-
           echo "Updating changelog for version $NEW_VERSION"
 
           TEMP_FILE="changelog_$(date +%s).tmp"
@@ -144,7 +161,6 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-
           git add version changelog.md changelog.txt
           if git diff --cached --quiet; then
             echo "No changes to commit"
@@ -152,3 +168,94 @@ jobs:
             git commit -m "CI: Update changelog for v$(cat version)" || true
             git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:${GITHUB_REF_NAME} || echo "::warning::Push failed"
           fi
+
+
+# =========================================
+# Этап 4 — Telegram уведомление
+# =========================================
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true  
+
+      - name: Setup timezone
+        run: |
+          sudo timedatectl set-timezone Europe/Moscow
+          echo "Current time: $(date)"
+
+      - name: Verify version
+        run: |
+          if [ ! -f version ]; then echo "1.0.0" > version; fi
+          echo "Current version: $(cat version)"
+
+      - name: Prepare changelog.txt
+        run: |
+          echo "╔══════════════════════════════╗" > changelog.txt
+          echo "║        BUILD SUMMARY         ║" >> changelog.txt
+          echo "╠══════════════════════════════╣" >> changelog.txt
+          echo "║ Version: $(cat version)      ║" >> changelog.txt
+          echo "║ Build: #$GITHUB_RUN_NUMBER   ║" >> changelog.txt
+          echo "║ Date: $(date +'%Y-%m-%d %H:%M MSK') ║" >> changelog.txt
+          echo "╚══════════════════════════════╝" >> changelog.txt
+          echo "" >> changelog.txt
+          if [ -f changelog.md ]; then
+            echo "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄" >> changelog.txt
+            echo "█ RECENT CHANGES:" >> changelog.txt
+            echo "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀" >> changelog.txt
+            grep -v '^##' changelog.md | head -n 5 | sed 's/^-/•/' >> changelog.txt
+          fi
+
+      - name: Send Telegram notification
+        run: |
+          TEXT="🚀 *Сборка #${{ github.run_number }} успешна\!*\n\n"
+          TEXT+="🏷 *Версия:* \`${{ steps.version.outputs.new_version }}\`\n"
+          TEXT+="📅 *Дата:* $(date +'%Y-%m-%d %H:%M MSK')\n"
+          TEXT+="🔗 *Подробности:* ${{ github.repository }}\n\n"
+          TEXT+="_Изменения во вложенном файле_ ↓"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="$TEXT"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument" \
+            -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -F document=@"changelog.txt"
+
+
+# =========================================
+# Этап 5 — публикация в DockerHub
+# =========================================
+  dockerhub_publish:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker login
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(tr -d '\r\n ' < version); v=${v#v}
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} .
+
+      - name: Push image
+        run: docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }}
+
+      - name: Add dockerhub label
+        if: github.event.pull_request != null
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          labels: docker-published
