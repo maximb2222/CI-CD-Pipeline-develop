@@ -36,7 +36,7 @@ jobs:
           name: test-results
           path: tests/TestResults/*.trx
 
-  # === ЭТАП 2: Проверка безопасности ===
+
   security:
     needs: test
     runs-on: ubuntu-latest
