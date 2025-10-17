@@ -1,3 +1,9 @@
+## [v1.0.1] - 2025-10-17
+- Branch: main
+- Commit: Update ci-cd.yml
+- Build: #14
+- Date: 2025-10-17 11:51:26
+
 ## [v1.0.0] - 2025-10-17
 - Build 6
 - Merged from 
