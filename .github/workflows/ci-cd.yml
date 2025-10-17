@@ -4,9 +4,9 @@ on: [push, pull_request]
 
 jobs:
 
-# =======================
-# Этап 1 — тестирование
-# =======================
+# ======================================
+# 1️⃣ Тестирование
+# ======================================
   test:
     runs-on: ubuntu-latest
     steps:
@@ -29,9 +29,9 @@ jobs:
           path: tests/TestResults/*.trx
 
 
-# =========================================
-# Этап 2 — проверка безопасности (VirusTotal)
-# =========================================
+# ======================================
+# 2️⃣ Проверка безопасности (VirusTotal)
+# ======================================
   security:
     needs: test
     runs-on: ubuntu-latest
@@ -42,11 +42,6 @@ jobs:
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
-
-      - name: Debug project structure
-        run: |
-          echo "Current directory: $(pwd)"
-          find . -name "*.csproj" -o -name "*.sln"
 
       - name: Build project
         run: dotnet build src --configuration Release
@@ -76,9 +71,9 @@ jobs:
           echo "$SCAN_RESULT" | jq .
 
 
-# =========================================
-# Этап 3 — сборка + changelog (исправленный)
-# =========================================
+# ======================================
+# 3️⃣ Сборка + версия + changelog
+# ======================================
   build:
     needs: security
     runs-on: ubuntu-latest
@@ -89,15 +84,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
 
-      - name: Build
-        run: dotnet build src --configuration Release || echo "::warning::Build failed"
+      - name: Build project
+        run: dotnet build src --configuration Release
 
       - name: Detect and bump version
         id: version
@@ -109,51 +104,56 @@ jobs:
 
           BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           echo "Current branch: $BRANCH"
+          echo "Event: ${GITHUB_EVENT_NAME}"
 
+          # Универсальная логика версии
           if [[ "$BRANCH" == feat/* ]]; then
             MINOR=$((MINOR + 1)); PATCH=0
           elif [[ "$BRANCH" == fix/* ]]; then
             PATCH=$((PATCH + 1))
-          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+          else
             PATCH=$((PATCH + 1))
           fi
 
           NEW_VERSION="$MAJOR.$MINOR.$PATCH"
           echo "$NEW_VERSION" > version
           echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "Bumped version: $NEW_VERSION"
+          echo "Version bumped to $NEW_VERSION"
 
-      - name: Update changelog (always on version change)
+      - name: Update changelog (always runs)
         run: |
           NEW_VERSION=$(cat version)
           BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           COMMIT_MSG=$(git log -1 --pretty=%B | head -n 1)
-          echo "Updating changelog for version $NEW_VERSION"
+          DATE=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "Updating changelog for version $NEW_VERSION ($BRANCH)"
 
           TEMP_FILE="changelog_$(date +%s).tmp"
           {
             echo "## [v${NEW_VERSION}] - $(date +'%Y-%m-%d')"
-            if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-              echo "- Merged from ${BRANCH}"
-            else
-              echo "- Commit: ${COMMIT_MSG}"
-            fi
+            echo "- Branch: ${BRANCH}"
+            echo "- Commit: ${COMMIT_MSG}"
             echo "- Build: #${GITHUB_RUN_NUMBER}"
+            echo "- Date: ${DATE}"
             echo ""
           } > "$TEMP_FILE"
 
           [ -f changelog.md ] && cat changelog.md >> "$TEMP_FILE"
           mv "$TEMP_FILE" changelog.md
 
-          {
-            echo "Version: ${NEW_VERSION}"
-            echo "Branch: ${BRANCH}"
-            echo "Commit: ${COMMIT_MSG}"
-            echo "Date: $(date +'%Y-%m-%d %H:%M:%S')"
-            echo ""
-            echo "Changes:"
-            tail -n +3 changelog.md
-          } > changelog.txt
+          echo "Version: ${NEW_VERSION}" > changelog.txt
+          echo "Branch: ${BRANCH}" >> changelog.txt
+          echo "Commit: ${COMMIT_MSG}" >> changelog.txt
+          echo "Date: ${DATE}" >> changelog.txt
+          echo "" >> changelog.txt
+          echo "Recent changes:" >> changelog.txt
+          head -n 10 changelog.md >> changelog.txt
+
+      - name: Ensure Git sees all changes
+        run: |
+          git reset
+          git add -A
+          git status
 
       - name: Commit & Push changelog
         env:
@@ -161,18 +161,25 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git add version changelog.md changelog.txt
+          git add -A
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
             git commit -m "CI: Update changelog for v$(cat version)" || true
-            git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:${GITHUB_REF_NAME} || echo "::warning::Push failed"
+            CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+              CURRENT_BRANCH="${GITHUB_REF_NAME}"
+            fi
+            echo "Detected branch: $CURRENT_BRANCH"
+            git pull --rebase origin "$CURRENT_BRANCH" || true
+            git push "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$CURRENT_BRANCH || echo "::warning::Push failed"
           fi
 
 
-# =========================================
-# Этап 4 — Telegram уведомление
-# =========================================
+# ======================================
+# 4️⃣ Уведомление в Telegram
+# ======================================
   notify:
     needs: build
     runs-on: ubuntu-latest
@@ -180,17 +187,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true  
 
       - name: Setup timezone
-        run: |
-          sudo timedatectl set-timezone Europe/Moscow
-          echo "Current time: $(date)"
-
-      - name: Verify version
-        run: |
-          if [ ! -f version ]; then echo "1.0.0" > version; fi
-          echo "Current version: $(cat version)"
+        run: sudo timedatectl set-timezone Europe/Moscow
 
       - name: Prepare changelog.txt
         run: |
@@ -203,10 +202,8 @@ jobs:
           echo "╚══════════════════════════════╝" >> changelog.txt
           echo "" >> changelog.txt
           if [ -f changelog.md ]; then
-            echo "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄" >> changelog.txt
-            echo "█ RECENT CHANGES:" >> changelog.txt
-            echo "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀" >> changelog.txt
-            grep -v '^##' changelog.md | head -n 5 | sed 's/^-/•/' >> changelog.txt
+            echo "Recent changes:" >> changelog.txt
+            head -n 10 changelog.md >> changelog.txt
           fi
 
       - name: Send Telegram notification
@@ -214,7 +211,7 @@ jobs:
           TEXT="🚀 *Сборка #${{ github.run_number }} успешна\!*\n\n"
           TEXT+="🏷 *Версия:* \`${{ steps.version.outputs.new_version }}\`\n"
           TEXT+="📅 *Дата:* $(date +'%Y-%m-%d %H:%M MSK')\n"
-          TEXT+="🔗 *Подробности:* ${{ github.repository }}\n\n"
+          TEXT+="🔗 *Репозиторий:* ${{ github.repository }}\n\n"
           TEXT+="_Изменения во вложенном файле_ ↓"
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
@@ -227,9 +224,9 @@ jobs:
             -F document=@"changelog.txt"
 
 
-# =========================================
-# Этап 5 — публикация в DockerHub
-# =========================================
+# ======================================
+# 5️⃣ DockerHub публикация
+# ======================================
   dockerhub_publish:
     runs-on: ubuntu-latest
     needs: build
@@ -242,9 +239,8 @@ jobs:
 
       - name: Read version
         id: ver
-        shell: bash
         run: |
-          v=$(tr -d '\r\n ' < version); v=${v#v}
+          v=$(tr -d '\r\n ' < version)
           echo "VERSION=$v" >> $GITHUB_OUTPUT
 
       - name: Build image
