@@ -1,212 +1,204 @@
-name: CI/CD Pipeline
+name: CI/CD for C# Script
 
 on:
   push:
-    branches: [ main, develop ]
+    branches:
+      - main
+      - dev
+      - staging
   pull_request:
-    branches: [ main ]
-    types: [ closed ]  # Триггер только на закрытие PR
+  workflow_dispatch:
 
-env:
-  DOCKER_IMAGE_NAME: ${{ github.repository }}
-  REGISTRY: docker.io
+permissions:
+  contents: write
 
 jobs:
-  validate-commits:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0    
-      - name: Validate Commit Messages
-        uses: wagoid/commitlint-github-action@v5
-        with:
-          configFile: .commitlintrc.json
 
+  # === ЭТАП 1: Тесты ===
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
         with:
-          fetch-depth: 0
-          fetch-tags: true
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-          cache: 'npm'
-      - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          dotnet-version: '8.0.x'
+
       - name: Run tests
-        run: npm test
-      - name: Run security audit
-        run: npm audit --audit-level high
+        run: |
+          cd tests
+          dotnet test --logger "trx;LogFileName=test-results.trx"
 
-  label-test-passed:
-    needs: test
-    if: ${{ github.event_name == 'pull_request' && needs.test.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions-ecosystem/action-add-labels@v1
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          labels: test-passed
+          name: test-results
+          path: tests/TestResults/*.trx
 
-  security-scan:
+  # === ЭТАП 2: Проверка безопасности ===
+  security:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/node@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
 
-  label-sec-passed:
-    needs: security-scan
-    if: ${{ github.event_name == 'pull_request' && needs.security-scan.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions-ecosystem/action-add-labels@v1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          labels: sec-passed
+          dotnet-version: '8.0.x'
 
-  build-and-deploy:
-    needs: test
+      - name: Build project
+        run: dotnet build src --configuration Release
+
+      - name: Check vulnerable packages
+        run: |
+          PROJECT_FILE=$(find src -name "*.csproj" | head -1)
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "Error: No .csproj found!"
+            exit 1
+          fi
+          dotnet list "$PROJECT_FILE" package --vulnerable || true
+
+      - name: VirusTotal scan
+        run: |
+          DLL_FILE=$(find src/bin/Release/net8.0 -name "*.dll" | head -1)
+          if [ -n "$DLL_FILE" ]; then
+            echo "Scanning $DLL_FILE..."
+            curl -s -X POST \
+              -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
+              -F "file=@$DLL_FILE" \
+              https://www.virustotal.com/api/v3/files || true
+          else
+            echo "No DLL found to scan."
+          fi
+
+  # === ЭТАП 3: Сборка и обновление changelog ===
+  build:
+    needs: security
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true)
-    outputs:
-      new_release_published: ${{ steps.semantic_version.outputs.new_release_published }}
-      new_release_version: ${{ steps.semantic_version.outputs.new_release_version }}
-      new_release_git_tag: ${{ steps.semantic_version.outputs.new_release_git_tag }}
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
         with:
-          node-version: '18'
-          cache: 'npm'
-      - name: Install dependencies
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build src --configuration Release
+
+      - name: Bump version
+        id: bump
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
+          if [ ! -f version ]; then echo "1.0.0" > version; fi
+
+          CURRENT=$(cat version)
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+          BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
+
+          if [ "$BRANCH" = "main" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
           else
-            npm install
+            PATCH=$((PATCH + 1))
           fi
-      - name: Semantic Release
-        id: semantic_version
-        uses: cycjimmy/semantic-release-action@v4
-        with:
-          extra_plugins: |
-            @semantic-release/changelog@6
-            @semantic-release/git@10
+
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "$NEW" > version
+          echo "version=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Update changelog
+        run: |
+          VERSION=$(cat version)
+          DATE=$(date +'%Y-%m-%d %H:%M:%S')
+          BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
+          BUILD=$GITHUB_RUN_NUMBER
+          TEMP="changelog_$(date +%s).tmp"
+
+          echo "## [v$VERSION] - $DATE" > $TEMP
+          echo "- Build $BUILD" >> $TEMP
+          echo "- Branch: $BRANCH" >> $TEMP
+          echo "" >> $TEMP
+          [ -f changelog.md ] && cat changelog.md >> $TEMP
+          mv $TEMP changelog.md
+
+          echo "✅ changelog.md updated successfully."
+
+      - name: Commit & Push changelog
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Debug semantic version output
         run: |
-          echo "NEW_RELEASE_PUBLISHED=${{ steps.semantic_version.outputs.new_release_published }}"
-          echo "NEW_RELEASE_VERSION=${{ steps.semantic_version.outputs.new_release_version }}"
-          echo "NEW_RELEASE_GIT_TAG=${{ steps.semantic_version.outputs.new_release_git_tag }}"
-      - name: Add changelog label
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: actions-ecosystem/action-add-labels@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          repo: ${{ github.repository }}
-          number: ${{ github.event.pull_request.number }}
-          labels: changelog
-      - name: Add version label
-        if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true }}
-        uses: actions-ecosystem/action-add-labels@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          repo: ${{ github.repository }}
-          number: ${{ github.event.pull_request.number }}
-          labels: ${{ steps.semantic_version.outputs.new_release_version }}
-      - name: Set up Docker Buildx
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        uses: docker/setup-buildx-action@v3
-      - name: Login to Docker Hub
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Build and push Docker image
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/${{ github.event.repository.name }}:latest
-            ${{ secrets.DOCKER_USERNAME }}/${{ github.event.repository.name }}:${{ steps.semantic_version.outputs.new_release_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Add dockerhub label
-        if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true }}
-        uses: actions-ecosystem/action-add-labels@v1
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          repo: ${{ github.repository }}
-          number: ${{ github.event.pull_request.number }}
-          labels: dockerhub
-      - name: Prepare changelog
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        run: cp CHANGELOG.md changelog.md
-      - name: Get date
-        id: date
-        run: echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-      - name: Send Telegram info message
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        uses: appleboy/telegram-action@master
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          message: |
-            Новый выпуск изменений
+          set -e
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
 
-            Проект: ${{ github.repository }}
-            Версия: ${{ steps.semantic_version.outputs.new_release_version }}
-            Дата: ${{ steps.date.outputs.date }}
-            Автор: ${{ github.actor }}
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git add changelog.md version
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m "CI: Update changelog for v$(cat version) [skip ci]" || true
+          git pull --rebase origin $CURRENT_BRANCH || true
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$CURRENT_BRANCH || echo "⚠️ Push failed but continuing..."
 
-            Информация о Git-репозитории
-            GIT TAG: https://github.com/${{ github.repository }}/releases/tag/${{ steps.semantic_version.outputs.new_release_git_tag }}
+      - name: Create git tag (only main)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          VERSION=$(cat version)
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION" || echo "⚠️ Failed to push tag"
 
-            Информация о Docker-репозитории
-            Владелец: ${{ secrets.DOCKER_USERNAME }}
-            Название: ${{ github.event.repository.name }}
-            Тег: ${{ steps.semantic_version.outputs.new_release_version }}
-            Полное имя: ${{ secrets.DOCKER_USERNAME }}/${{ github.event.repository.name }}:${{ steps.semantic_version.outputs.new_release_version }}
-      - name: Send changelog file
-        if: ${{ steps.semantic_version.outputs.new_release_published == 'true' }}
-        uses: appleboy/telegram-action@master
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          document: changelog.md
-          caption: 'CHANGELOG.md'
-
-  deploy:
-    needs: build-and-deploy
+  # === ЭТАП 4: Уведомление в Telegram ===
+  notify:
+    needs: build
     runs-on: ubuntu-latest
-    if: ${{ needs.build-and-deploy.outputs.new_release_published == 'true' }}
     steps:
-      - name: Deploy to staging (Mock)
-        run: echo "Deploy step"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Send Telegram message
+        run: |
+          VERSION=$(cat version)
+          BUILD=$GITHUB_RUN_NUMBER
+          BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
+          TEXT="✅ *Build successful!*%0A
+          *Version:* v$VERSION%0A
+          *Build:* #$BUILD%0A
+          *Branch:* $BRANCH%0A
+          [View Workflow Run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d parse_mode="Markdown" \
+            -d text="$TEXT" || true
+
+  # === ЭТАП 5: Публикация Docker образа ===
+  dockerhub_publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker login
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(tr -d '\r\n ' < version); v=${v#v}
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} .
+
+      - name: Push image
+        run: docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }}
