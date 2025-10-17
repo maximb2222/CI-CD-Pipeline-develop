@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD for C# Script
 
 on:
   push:
@@ -7,109 +7,132 @@ on:
       - dev
       - staging
   pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+
+  # === ЭТАП 1: Тесты ===
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
         with:
-          persist-credentials: true
-          fetch-depth: 0
+          dotnet-version: '8.0.x'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Run tests
+        run: |
+          cd tests
+          dotnet test --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
         with:
-          node-version: '20'
+          name: test-results
+          path: tests/TestResults/*.trx
 
-      - name: Install dependencies
-        run: npm ci
+  # === ЭТАП 2: Проверка безопасности ===
+  security:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Run build
-        run: npm run build
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build project
+        run: dotnet build src --configuration Release
+
+      - name: Check vulnerable packages
+        run: |
+          PROJECT_FILE=$(find src -name "*.csproj" | head -1)
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "Error: No .csproj found!"
+            exit 1
+          fi
+          dotnet list "$PROJECT_FILE" package --vulnerable || true
 
       - name: VirusTotal scan
         run: |
-          echo "Scanning files..."
-          jq --version || true
-
-      - name: Bump version (smart)
-        id: version
-        run: |
-          echo "🔹 Starting version bump..."
-          if [ ! -f version ]; then
-            echo "1.0.0" > version
+          DLL_FILE=$(find src/bin/Release/net8.0 -name "*.dll" | head -1)
+          if [ -n "$DLL_FILE" ]; then
+            echo "Scanning $DLL_FILE..."
+            curl -s -X POST \
+              -H "x-apikey: ${{ secrets.VIRUSTOTAL_API_KEY }}" \
+              -F "file=@$DLL_FILE" \
+              https://www.virustotal.com/api/v3/files || true
+          else
+            echo "No DLL found to scan."
           fi
 
+  # === ЭТАП 3: Сборка и обновление changelog ===
+  build:
+    needs: security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build src --configuration Release
+
+      - name: Bump version
+        id: bump
+        run: |
+          if [ ! -f version ]; then echo "1.0.0" > version; fi
+
           CURRENT=$(cat version)
-          BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
-          BUILD=$GITHUB_RUN_NUMBER
-
-          echo "Current version: $CURRENT"
-          echo "Branch: $BRANCH"
-          echo "Build: $BUILD"
-
           MAJOR=$(echo $CURRENT | cut -d. -f1)
           MINOR=$(echo $CURRENT | cut -d. -f2)
           PATCH=$(echo $CURRENT | cut -d. -f3)
+          BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
 
           if [ "$BRANCH" = "main" ]; then
-            # увеличиваем минорную версию
             MINOR=$((MINOR + 1))
             PATCH=0
-            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-            echo "🔼 New minor version: $NEW_VERSION"
           else
-            # увеличиваем только билд внутри текущей версии
             PATCH=$((PATCH + 1))
-            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
-            echo "📦 New patch version: $NEW_VERSION"
           fi
 
-          echo "$NEW_VERSION" > version
-          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "$NEW" > version
+          echo "version=$NEW" >> $GITHUB_OUTPUT
 
       - name: Update changelog
         run: |
           VERSION=$(cat version)
-          DATE=$(date +'%Y-%m-%d')
-          BUILD=$GITHUB_RUN_NUMBER
+          DATE=$(date +'%Y-%m-%d %H:%M:%S')
           BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
+          BUILD=$GITHUB_RUN_NUMBER
           TEMP="changelog_$(date +%s).tmp"
 
-          echo "🔍 Updating changelog for version $VERSION (build $BUILD)..."
+          echo "## [v$VERSION] - $DATE" > $TEMP
+          echo "- Build $BUILD" >> $TEMP
+          echo "- Branch: $BRANCH" >> $TEMP
+          echo "" >> $TEMP
+          [ -f changelog.md ] && cat changelog.md >> $TEMP
+          mv $TEMP changelog.md
 
-          if [ -f changelog.md ] && grep -q "## \[v$VERSION\]" changelog.md; then
-            echo "Version $VERSION already exists — appending new build info."
-            awk -v ver="## [v$VERSION]" -v build="$BUILD" -v branch="$BRANCH" -v date="$DATE" '
-              $0 == ver { print; print "- Build " build; print "- Branch: " branch; print "- Date: " date; next }
-              1
-            ' changelog.md > "$TEMP"
-          else
-            echo "New version detected — creating new changelog entry."
-            {
-              echo "## [v$VERSION] - $DATE"
-              echo "- Build $BUILD"
-              echo "- Branch: $BRANCH"
-              echo
-              [ -f changelog.md ] && cat changelog.md
-            } > "$TEMP"
-          fi
+          echo "✅ changelog.md updated successfully."
 
-          mv "$TEMP" changelog.md
-          echo "✅ changelog.md updated for version $VERSION"
-
-      - name: Commit and push changes
+      - name: Commit & Push changelog
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -118,40 +141,64 @@ jobs:
           git config --global user.email "actions@github.com"
 
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-          echo "Working on branch: $CURRENT_BRANCH"
-
-          git add changelog.md version || true
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-
-          git commit -m "CI: Update changelog and version v$(cat version) [skip ci]" || true
+          git add changelog.md version
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m "CI: Update changelog for v$(cat version) [skip ci]" || true
           git pull --rebase origin $CURRENT_BRANCH || true
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$CURRENT_BRANCH || echo "⚠️ Push failed, continuing..."
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" HEAD:$CURRENT_BRANCH || echo "⚠️ Push failed but continuing..."
 
+      - name: Create git tag (only main)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          VERSION=$(cat version)
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION" || echo "⚠️ Failed to push tag"
+
+  # === ЭТАП 4: Уведомление в Telegram ===
   notify:
     needs: build
     runs-on: ubuntu-latest
-    if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          persist-credentials: true
           fetch-depth: 0
 
-      - name: Send Telegram notification
+      - name: Send Telegram message
         run: |
           VERSION=$(cat version)
           BUILD=$GITHUB_RUN_NUMBER
           BRANCH=${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}
-          TEXT="✅ *Build Successful*%0A
-          • Version: v$VERSION%0A
-          • Build: #$BUILD%0A
-          • Branch: $BRANCH%0A
-          • Repo: $GITHUB_REPOSITORY%0A
+          TEXT="✅ *Build successful!*%0A
+          *Version:* v$VERSION%0A
+          *Build:* #$BUILD%0A
+          *Branch:* $BRANCH%0A
           [View Workflow Run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)"
 
-          echo "Sending Telegram notification..."
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d parse_mode="Markdown" \
             -d text="$TEXT" || true
+
+  # === ЭТАП 5: Публикация Docker образа ===
+  dockerhub_publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker login
+        run: echo "${{ secrets.DOCKER_HUB_TOKEN }}" | docker login -u "${{ secrets.DOCKER_HUB_LOGIN }}" --password-stdin
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(tr -d '\r\n ' < version); v=${v#v}
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        run: docker build -t ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }} .
+
+      - name: Push image
+        run: docker push ${{ secrets.DOCKER_HUB_LOGIN }}/ci-cd-pipeline:v${{ steps.ver.outputs.VERSION }}
